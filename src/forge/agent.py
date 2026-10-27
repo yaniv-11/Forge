@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -29,12 +30,18 @@ class AgentLoop:
         tool_dispatcher: ToolDispatcher,
         max_steps: int = 8,
         max_tool_calls: int = 10,
+        debug: bool = False,
     ) -> None:
         self.model_client = model_client
         self.tool_registry = tool_registry
         self.tool_dispatcher = tool_dispatcher
         self.max_steps = max_steps
         self.max_tool_calls = max_tool_calls
+        self.debug = debug
+
+    def _trace(self, message: str) -> None:
+        if self.debug:
+            print(f"[TRACE] {message}")
 
     def run(self, task: str) -> AgentState:
         state = AgentState(task=task)
@@ -42,14 +49,17 @@ class AgentLoop:
 
         while state.steps < self.max_steps:
             state.steps += 1
+            self._trace(f"Step {state.steps}: sending model request")
 
             response = self.model_client.send_messages(
                 messages=state.messages,
                 tools=self.tool_registry.model_tools(),
             )
+            self._trace(f"Model response: {response}")
 
             if response.get("final_answer"):
                 state.final_answer = response["final_answer"]
+                self._trace("Final answer received from model")
                 return state
 
             tool_call = response.get("tool_call")
@@ -63,9 +73,34 @@ class AgentLoop:
                 state.last_error = "Max tool call budget exceeded."
                 return state
 
+            self._trace(f"Executing tool call: {tool_call}")
             tool_result = self.tool_dispatcher.execute(tool_call)
             state.tool_calls += 1
-            state.messages.append({"role": "tool", "content": str(tool_result)})
+            self._trace(f"Tool result: {tool_result}")
+
+            tool_call_id = tool_call.get("id") or f"call_{state.tool_calls}"
+            assistant_tool_message = {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": tool_call_id,
+                        "type": "function",
+                        "function": {
+                            "name": tool_call["name"],
+                            "arguments": json.dumps(tool_call.get("arguments", {})),
+                        },
+                    }
+                ],
+            }
+            state.messages.append(assistant_tool_message)
+            state.messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "content": str(tool_result),
+                }
+            )
 
             if tool_result.get("status") == "error":
                 state.last_error = tool_result.get("error", "tool execution failed")
