@@ -134,10 +134,14 @@ class OpenRouterClient:
             except json.JSONDecodeError:
                 arguments = {}
 
-        return {
+        parsed = {
             "name": function.get("name"),
             "arguments": arguments,
         }
+        tool_call_id = first.get("id")
+        if tool_call_id:
+            parsed["id"] = tool_call_id
+        return parsed
 
 
 GroqClient = OpenRouterClient

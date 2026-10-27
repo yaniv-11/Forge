@@ -22,6 +22,8 @@ class Settings:
     extra_headers: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        self._load_dotenv_file()
+
         if self.api_key is None:
             self.api_key = os.getenv("OPENROUTER_API_KEY")
         if self.model_name is None:
@@ -32,6 +34,31 @@ class Settings:
             self.app_name = os.getenv("FORGE_APP_NAME", "Forge")
         if self.provider is None:
             self.provider = os.getenv("FORGE_PROVIDER", "openrouter")
+        if not self.debug:
+            self.debug = os.getenv("FORGE_DEBUG", "false").lower() in {"1", "true", "yes", "on"}
+
+    def _load_dotenv_file(self) -> None:
+        workspace_root = Path(self.workspace_root).resolve()
+        candidates = [
+            workspace_root / ".env",
+            Path.cwd() / ".env",
+            Path(__file__).resolve().parents[2] / ".env",
+        ]
+
+        for candidate in candidates:
+            if not candidate.exists():
+                continue
+
+            for raw_line in candidate.read_text(encoding="utf-8").splitlines():
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+
+                key, value = [part.strip() for part in line.split("=", 1)]
+                value = value.strip().strip('"').strip("'")
+                os.environ.setdefault(key, value)
+
+            break
 
     def resolve_workspace(self) -> Path:
         return Path(self.workspace_root).resolve()
