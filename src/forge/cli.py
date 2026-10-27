@@ -10,30 +10,37 @@ from .tool_registry import ToolDefinition, ToolRegistry
 from .tools.filesystem import list_files, read_file
 
 
-def build_registry() -> ToolRegistry:
+def build_registry(workspace_root: Path) -> ToolRegistry:
     registry = ToolRegistry()
+
+    def guarded_list_files(path: str = ".") -> list[str]:
+        return list_files(path=path, workspace_root=workspace_root)
+
+    def guarded_read_file(path: str) -> str:
+        return read_file(path=path, workspace_root=workspace_root)
+
     registry.register(
         ToolDefinition(
             name="list_files",
-            description="List files and directories in a given path.",
+            description="List files and directories in a given path within the workspace.",
             arguments_schema={
                 "type": "object",
                 "properties": {"path": {"type": "string"}},
                 "required": ["path"],
             },
-            handler=list_files,
+            handler=guarded_list_files,
         )
     )
     registry.register(
         ToolDefinition(
             name="read_file",
-            description="Read the contents of a file from the workspace.",
+            description="Read the contents of a file from within the workspace.",
             arguments_schema={
                 "type": "object",
                 "properties": {"path": {"type": "string"}},
                 "required": ["path"],
             },
-            handler=read_file,
+            handler=guarded_read_file,
         )
     )
     return registry
@@ -47,7 +54,7 @@ def main() -> None:
         provider="openrouter",
         model_name="openai/gpt-4o-mini",
     )
-    registry = build_registry()
+    registry = build_registry(workspace)
     dispatcher = ToolDispatcher(registry)
     model_client = OpenRouterClient(
         api_key=settings.api_key,
@@ -63,6 +70,7 @@ def main() -> None:
         tool_dispatcher=dispatcher,
         max_steps=settings.max_steps,
         max_tool_calls=settings.max_tool_calls,
+        debug=settings.debug,
     )
 
     result = loop.run(task)
