@@ -3,7 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from .agent import AgentLoop
-from .model_client import GroqClient
+from .config import Settings
+from .model_client import OpenRouterClient
 from .tool_dispatcher import ToolDispatcher
 from .tool_registry import ToolDefinition, ToolRegistry
 from .tools.filesystem import list_files, read_file
@@ -41,15 +42,27 @@ def build_registry() -> ToolRegistry:
 def main() -> None:
     task = input("forge> ")
     workspace = Path.cwd().resolve()
+    settings = Settings(
+        workspace_root=workspace,
+        provider="openrouter",
+        model_name="openai/gpt-4o-mini",
+    )
     registry = build_registry()
     dispatcher = ToolDispatcher(registry)
-    model_client = GroqClient(api_key=None, model="llama-3.1-8b-instant")
+    model_client = OpenRouterClient(
+        api_key=settings.api_key,
+        model=settings.model_name,
+        base_url=settings.base_url,
+        timeout=settings.timeout_seconds,
+        site_url=settings.site_url,
+        app_name=settings.app_name,
+    )
     loop = AgentLoop(
         model_client=model_client,
         tool_registry=registry,
         tool_dispatcher=dispatcher,
-        max_steps=8,
-        max_tool_calls=10,
+        max_steps=settings.max_steps,
+        max_tool_calls=settings.max_tool_calls,
     )
 
     result = loop.run(task)
