@@ -12,6 +12,9 @@ class ToolDefinition:
     description: str
     arguments_schema: dict[str, Any]
     handler: Callable[..., Any]
+    permission: str = "read"
+    risk: str = "low"
+    approval_required: bool = False
 
 
 class ToolRegistry:
