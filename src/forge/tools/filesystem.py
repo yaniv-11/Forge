@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import re
+import shlex
+import subprocess
 from pathlib import Path
+from typing import Any
 
 
 def resolve_allowed_path(path: str, workspace_root: Path) -> Path:
@@ -97,6 +100,73 @@ def read_file(path: str, workspace_root: Path | None = None) -> str:
     return resolved.read_text(encoding="utf-8")
 
 
+def run_command(
+    command: list[str] | str,
+    cwd: str = ".",
+    workspace_root: Path | None = None,
+    timeout: int = 30,
+    env: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    if workspace_root is None:
+        raise ValueError("workspace_root is required for command execution")
+
+    resolved_cwd = resolve_allowed_path(cwd, workspace_root)
+    if isinstance(command, str):
+        argv = shlex.split(command)
+    else:
+        argv = list(command)
+
+    if not argv:
+        raise ValueError("Command must not be empty")
+
+    execution_env = dict(__import__("os").environ)
+    if env:
+        execution_env.update(env)
+
+    completed = subprocess.run(
+        argv,
+        cwd=str(resolved_cwd),
+        env=execution_env,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+
+    return {
+        "returncode": completed.returncode,
+        "stdout": completed.stdout,
+        "stderr": completed.stderr,
+        "cwd": str(resolved_cwd.relative_to(workspace_root.resolve())),
+    }
+
+
+def create_file(path: str, content: str, workspace_root: Path | None = None) -> str:
+    if workspace_root is None:
+        raise ValueError("workspace_root is required for create operations")
+
+    target = _prepare_write_target(path, workspace_root)
+    if target.exists():
+        raise FileExistsError(f"File already exists: {path}")
+
+    target.write_text(content, encoding="utf-8")
+    return str(target.relative_to(workspace_root.resolve()))
+
+
+def replace_file(path: str, content: str, workspace_root: Path | None = None) -> str:
+    if workspace_root is None:
+        raise ValueError("workspace_root is required for replace operations")
+
+    target = _prepare_write_target(path, workspace_root)
+    if not target.exists():
+        raise FileNotFoundError(f"File does not exist: {path}")
+    if target.is_dir():
+        raise ValueError(f"Path points to a directory, not a file: {path}")
+
+    target.write_text(content, encoding="utf-8")
+    return str(target.relative_to(workspace_root.resolve()))
+
+
 def write_file(path: str, content: str, workspace_root: Path | None = None) -> str:
     if workspace_root is None:
         raise ValueError("workspace_root is required for write operations")
@@ -109,14 +179,22 @@ def write_file(path: str, content: str, workspace_root: Path | None = None) -> s
 def edit_file(path: str, old: str, new: str, workspace_root: Path | None = None) -> str:
     if workspace_root is None:
         raise ValueError("workspace_root is required for edit operations")
+    if old == "":
+        raise ValueError("Target text must not be empty")
 
     target = _prepare_write_target(path, workspace_root)
     if not target.exists():
         raise FileNotFoundError(f"File does not exist: {path}")
 
     existing = target.read_text(encoding="utf-8")
-    if old not in existing:
+    occurrence_count = existing.count(old)
+    if occurrence_count == 0:
         raise ValueError(f"Target text not found in file: {path}")
+    if occurrence_count > 1:
+        raise ValueError(
+            f"Ambiguous edit: target text appears {occurrence_count} times in file: {path}. "
+            "Provide a longer, unique snippet."
+        )
 
     updated = existing.replace(old, new, 1)
     target.write_text(updated, encoding="utf-8")
