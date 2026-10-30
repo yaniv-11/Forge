@@ -2,8 +2,37 @@ from __future__ import annotations
 
 import json
 import os
+from dataclasses import dataclass, field
 from typing import Any
 from urllib import error, request
+
+
+@dataclass
+class ToolCall:
+    """Normalized representation of a model tool call."""
+
+    id: str | None = None
+    name: str | None = None
+    arguments: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class TokenUsage:
+    """Token accounting for a model response."""
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
+
+
+@dataclass
+class ModelResponse:
+    """Provider-independent model response contract."""
+
+    message: str = ""
+    tool_calls: list[ToolCall] = field(default_factory=list)
+    finish_reason: str | None = None
+    usage: TokenUsage | None = None
 
 
 class OpenRouterClient:
@@ -58,18 +87,17 @@ class OpenRouterClient:
             raise RuntimeError(f"OpenRouter API request failed: {exc.code} {response_text}") from exc
 
         data = json.loads(raw_data)
-        parsed_tool_call = self.parse_tool_call(data)
-        if parsed_tool_call:
-            return {"tool_call": parsed_tool_call}
+        normalized = self.parse_model_response(data)
+        if normalized.tool_calls:
+            return {
+                "tool_calls": [
+                    {"id": call.id, "name": call.name, "arguments": call.arguments}
+                    for call in normalized.tool_calls
+                ],
+                "finish_reason": normalized.finish_reason,
+            }
 
-        message = (data.get("choices") or [{}])[0].get("message", {})
-        content = message.get("content") or ""
-        if isinstance(content, list):
-            content = " ".join(
-                part.get("text", "") for part in content if isinstance(part, dict)
-            )
-
-        return {"final_answer": str(content) if content else "OpenRouter returned no final answer."}
+        return {"final_answer": normalized.message or "OpenRouter returned no final answer."}
 
     def _mock_response_for_tests(
         self,
@@ -80,18 +108,16 @@ class OpenRouterClient:
 
         if "list files" in last_user_message.lower():
             return {
-                "tool_call": {
-                    "name": "list_files",
-                    "arguments": {"path": "."},
-                }
+                "tool_calls": [
+                    {"id": "call_mock_1", "name": "list_files", "arguments": {"path": "."}},
+                ]
             }
 
         if "read file" in last_user_message.lower():
             return {
-                "tool_call": {
-                    "name": "read_file",
-                    "arguments": {"path": "README.md"},
-                }
+                "tool_calls": [
+                    {"id": "call_mock_1", "name": "read_file", "arguments": {"path": "README.md"}},
+                ]
             }
 
         return {"final_answer": "Mock model response: task was acknowledged and handled without a live API call."}
@@ -111,36 +137,65 @@ class OpenRouterClient:
             payload["tool_choice"] = "auto"
         return payload
 
-    def parse_tool_call(self, raw_response: dict[str, Any]) -> dict[str, Any] | None:
+    def parse_model_response(self, raw_response: dict[str, Any]) -> ModelResponse:
         choices = raw_response.get("choices") or []
         if not choices:
-            return None
+            return ModelResponse()
 
         message = choices[0].get("message", {})
         if not message:
+            return ModelResponse()
+
+        tool_calls_raw = message.get("tool_calls") or []
+        tool_calls = []
+        for raw_call in tool_calls_raw:
+            function = raw_call.get("function", {})
+            arguments = function.get("arguments", "{}")
+            if isinstance(arguments, str):
+                try:
+                    arguments = json.loads(arguments)
+                except json.JSONDecodeError:
+                    arguments = {}
+            tool_calls.append(
+                ToolCall(
+                    id=raw_call.get("id"),
+                    name=function.get("name"),
+                    arguments=arguments if isinstance(arguments, dict) else {},
+                )
+            )
+
+        content = message.get("content") or ""
+        if isinstance(content, list):
+            content = " ".join(
+                part.get("text", "") for part in content if isinstance(part, dict)
+            )
+
+        usage = message.get("usage")
+        token_usage = None
+        if isinstance(usage, dict):
+            prompt_tokens = usage.get("prompt_tokens", 0)
+            completion_tokens = usage.get("completion_tokens", 0)
+            token_usage = TokenUsage(
+                input_tokens=prompt_tokens,
+                output_tokens=completion_tokens,
+                total_tokens=prompt_tokens + completion_tokens,
+            )
+
+        return ModelResponse(
+            message=str(content) if content else "",
+            tool_calls=tool_calls,
+            finish_reason=(choices[0].get("finish_reason") if len(choices) else None),
+            usage=token_usage,
+        )
+
+    def parse_tool_call(self, raw_response: dict[str, Any]) -> dict[str, Any] | None:
+        normalized = self.parse_model_response(raw_response)
+        if not normalized.tool_calls:
             return None
-
-        tool_calls = message.get("tool_calls") or []
-        if not tool_calls:
-            return None
-
-        first = tool_calls[0]
-        function = first.get("function", {})
-        arguments = function.get("arguments", "{}")
-
-        if isinstance(arguments, str):
-            try:
-                arguments = json.loads(arguments)
-            except json.JSONDecodeError:
-                arguments = {}
-
-        parsed = {
-            "name": function.get("name"),
-            "arguments": arguments,
-        }
-        tool_call_id = first.get("id")
-        if tool_call_id:
-            parsed["id"] = tool_call_id
+        first = normalized.tool_calls[0]
+        parsed = {"name": first.name, "arguments": first.arguments}
+        if first.id:
+            parsed["id"] = first.id
         return parsed
 
 
