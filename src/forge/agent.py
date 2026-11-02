@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import concurrent.futures
 import json
+import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 from .planning import PlanManager
 from .prompts import PromptBuilder
 from .tool_dispatcher import ToolDispatcher
 from .tool_registry import ToolRegistry
+from .memory import compact_messages
 
 
 @dataclass
@@ -20,6 +23,10 @@ class AgentState:
     steps: int = 0
     final_answer: str | None = None
     last_error: str | None = None
+    usage: dict[str, int] = field(default_factory=dict)
+    elapsed_seconds: float = 0.0
+    tool_retries: int = 0
+    plan: dict[str, Any] = field(default_factory=dict)
 
 
 class AgentLoop:
@@ -35,6 +42,12 @@ class AgentLoop:
         debug: bool = False,
         plan_manager: PlanManager | None = None,
         prompt_builder: PromptBuilder | None = None,
+        parallel_tools: bool = True,
+        max_retries: int = 3,
+        observability: Any | None = None,
+        event_callback: Callable[[str, dict[str, Any]], None] | None = None,
+        initial_messages: list[dict[str, Any]] | None = None,
+        max_context_tokens: int = 12000,
     ) -> None:
         self.model_client = model_client
         self.tool_registry = tool_registry
@@ -44,12 +57,25 @@ class AgentLoop:
         self.debug = debug
         self.plan_manager = plan_manager or PlanManager("")
         self.prompt_builder = prompt_builder or PromptBuilder()
+        self.parallel_tools = parallel_tools
+        self.max_retries = max_retries
+        self.observability = observability
+        self.event_callback = event_callback
+        self.initial_messages = initial_messages
+        self.max_context_tokens = max_context_tokens
+
+    def _emit(self, event: str, data: dict[str, Any]) -> None:
+        if self.event_callback:
+            self.event_callback(event, data)
+        if self.observability:
+            self.observability.record(event, data)
 
     def _trace(self, message: str) -> None:
         if self.debug:
             print(f"[TRACE] {message}")
 
     def run(self, task: str) -> AgentState:
+        started = time.monotonic()
         safe_task = self.prompt_builder.sanitize_user_task(task)
         self.plan_manager.plan.objective = safe_task
         if not self.plan_manager.plan.steps:
@@ -58,7 +84,10 @@ class AgentLoop:
             self.plan_manager.add_step("verify with tests")
 
         state = AgentState(task=safe_task)
+        if self.initial_messages:
+            state.messages.extend(self.initial_messages)
         state.messages.extend(self.prompt_builder.build_messages(safe_task))
+        state.messages = compact_messages(state.messages, self.max_context_tokens)
 
         while state.steps < self.max_steps:
             state.steps += 1
@@ -69,10 +98,17 @@ class AgentLoop:
                 tools=self.tool_registry.model_tools(),
             )
             self._trace(f"Model response: {response}")
+            usage = response.get("usage") or {}
+            for key in ("input_tokens", "output_tokens", "total_tokens"):
+                state.usage[key] = state.usage.get(key, 0) + int(usage.get(key, 0) or 0)
+            self._emit("model_response", {"step": state.steps, "usage": usage})
 
             if response.get("final_answer"):
                 state.final_answer = response["final_answer"]
                 self._trace("Final answer received from model")
+                state.elapsed_seconds = time.monotonic() - started
+                self._emit("task_completed", {"elapsed_seconds": state.elapsed_seconds})
+                state.plan = self.plan_manager.to_dict()
                 return state
 
             tool_calls = response.get("tool_calls") or []
@@ -84,6 +120,8 @@ class AgentLoop:
             if not tool_calls:
                 state.final_answer = "The model returned no actionable result."
                 state.last_error = "No tool call or final answer was returned."
+                state.elapsed_seconds = time.monotonic() - started
+                state.plan = self.plan_manager.to_dict()
                 return state
 
             self._trace(f"Executing {len(tool_calls)} tool call(s): {tool_calls}")
@@ -105,31 +143,48 @@ class AgentLoop:
             }
             state.messages.append(assistant_tool_message)
 
-            for tool_call in tool_calls:
-                if state.tool_calls >= self.max_tool_calls:
-                    state.final_answer = "Execution stopped because the tool call limit was reached."
-                    state.last_error = "Max tool call budget exceeded."
-                    return state
+            calls_to_run = tool_calls[: max(0, self.max_tool_calls - state.tool_calls)]
 
-                tool_result = self.tool_dispatcher.execute(tool_call)
+            def execute_with_retry(tool_call: dict[str, Any]) -> dict[str, Any]:
+                result: dict[str, Any] = {"status": "error", "error": "Tool execution failed."}
+                for attempt in range(self.max_retries + 1):
+                    result = self.tool_dispatcher.execute(tool_call)
+                    if result.get("status") != "error" or result.get("error_type") == "permission_denied":
+                        return result
+                    if attempt < self.max_retries:
+                        state.tool_retries += 1
+                        reason = str(result.get("error", "tool failed"))
+                        self.plan_manager.record_failure(reason)
+                        self._emit("tool_retry", {"name": tool_call.get("name"), "attempt": attempt + 1, "reason": reason})
+                return result
+
+            if self.parallel_tools and len(calls_to_run) > 1:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(calls_to_run), 4)) as pool:
+                    futures = {pool.submit(execute_with_retry, call): call for call in calls_to_run}
+                    results_by_call = [future.result() for future in futures]
+                    tool_results = results_by_call
+            else:
+                tool_results = [execute_with_retry(call) for call in calls_to_run]
+
+            for tool_call, tool_result in zip(calls_to_run, tool_results):
                 state.tool_calls += 1
                 self._trace(f"Tool result: {tool_result}")
-
                 tool_call_id = tool_call.get("id") or f"call_{state.tool_calls}"
-                state.messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": tool_call_id,
-                        "content": str(tool_result),
-                    }
-                )
-
+                state.messages.append({"role": "tool", "tool_call_id": tool_call_id, "content": str(tool_result)})
+                self._emit("tool_result", {"name": tool_call.get("name"), "status": tool_result.get("status")})
                 if tool_result.get("status") == "error":
                     state.last_error = tool_result.get("error", "tool execution failed")
 
             if state.tool_calls >= self.max_tool_calls:
-                continue
+                state.final_answer = "Execution stopped because the tool call limit was reached."
+                state.last_error = "Max tool call budget exceeded."
+                state.elapsed_seconds = time.monotonic() - started
+                state.plan = self.plan_manager.to_dict()
+                return state
 
         state.final_answer = "The agent reached the maximum step limit before completing the task."
         state.last_error = "Max agent iteration limit reached."
+        state.elapsed_seconds = time.monotonic() - started
+        state.plan = self.plan_manager.to_dict()
+        state.plan = self.plan_manager.to_dict()
         return state

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any
+from typing import Callable
 
 from .tool_registry import ToolRegistry
 
@@ -28,8 +29,13 @@ def _matches_type(expected_type: Any, value: Any) -> bool:
 class ToolDispatcher:
     """Validates and invokes registry-defined tools."""
 
-    def __init__(self, registry: ToolRegistry) -> None:
+    def __init__(
+        self,
+        registry: ToolRegistry,
+        approval_handler: Callable[[str, dict[str, Any]], bool] | None = None,
+    ) -> None:
         self.registry = registry
+        self.approval_handler = approval_handler
 
     def validate_arguments(self, schema: dict[str, Any], arguments: dict[str, Any]) -> str | None:
         if not isinstance(schema, dict):
@@ -69,7 +75,13 @@ class ToolDispatcher:
             return {"status": "error", "error_type": "validation_error", "error": validation_error}
 
         if tool.approval_required:
-            return {"status": "error", "error_type": "permission_denied", "error": f"Tool {name} requires user approval."}
+            approved = bool(self.approval_handler and self.approval_handler(name, arguments))
+            if not approved:
+                return {
+                    "status": "error",
+                    "error_type": "permission_denied",
+                    "error": f"Tool {name} requires user approval.",
+                }
 
         try:
             result = tool.handler(**arguments)

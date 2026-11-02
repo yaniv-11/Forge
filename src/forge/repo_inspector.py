@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import ast
 from pathlib import Path
 from typing import Any
 
@@ -23,7 +24,13 @@ class RepositoryInspector:
             if not file_path.is_file():
                 continue
             rel_path = file_path.relative_to(self.workspace_root).as_posix()
-            if rel_path.startswith(".git/") or any(part.startswith(".") for part in Path(rel_path).parts[:-1]):
+            if (
+                rel_path.startswith(".git/")
+                or rel_path.startswith(".forge/")
+                or rel_path.startswith(".forge_sessions/")
+                or rel_path.startswith(".venv/")
+                or any(part.startswith(".") for part in Path(rel_path).parts[:-1])
+            ):
                 continue
 
             score = 0
@@ -59,4 +66,48 @@ class RepositoryInspector:
             "task": task,
             "relevant_paths": relevant,
             "total_candidates": len(candidates),
+            "symbols": self.find_python_symbols(relevant, task),
+            "dependencies": self.detect_dependencies(),
+            "context": self.build_context(relevant),
         }
+
+    def find_python_symbols(self, paths: list[str], task: str) -> dict[str, list[str]]:
+        symbols: dict[str, list[str]] = {}
+        tokens = {token.lower() for token in re.findall(r"[A-Za-z0-9_]+", task)}
+        for rel_path in paths:
+            if not rel_path.endswith(".py"):
+                continue
+            file_path = self.workspace_root / rel_path
+            try:
+                tree = ast.parse(file_path.read_text(encoding="utf-8"))
+            except (SyntaxError, UnicodeDecodeError, OSError):
+                continue
+            found = []
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    if any(token in node.name.lower() for token in tokens) or not tokens:
+                        found.append(node.name)
+            if found:
+                symbols[rel_path] = found[:20]
+        return symbols
+
+    def detect_dependencies(self) -> dict[str, list[str]]:
+        names = ("pyproject.toml", "requirements.txt", "package.json", "Cargo.toml", "go.mod")
+        return {
+            name: (self.workspace_root / name).read_text(encoding="utf-8").splitlines()[:100]
+            for name in names
+            if (self.workspace_root / name).is_file()
+        }
+
+    def build_context(self, paths: list[str], max_lines: int = 40) -> dict[str, str]:
+        context: dict[str, str] = {}
+        for rel_path in paths[:5]:
+            file_path = self.workspace_root / rel_path
+            if not file_path.is_file():
+                continue
+            try:
+                lines = file_path.read_text(encoding="utf-8").splitlines()
+            except (UnicodeDecodeError, OSError):
+                continue
+            context[rel_path] = "\n".join(lines[:max_lines])
+        return context

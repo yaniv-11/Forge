@@ -7,6 +7,16 @@ from pathlib import Path
 from typing import Any
 
 
+DEFAULT_COMMAND_ALLOWLIST = {
+    "python", "python3", "py",
+    "pytest",
+    "git",
+    "npm", "npx", "node",
+    "dotnet", "cargo", "go",
+    "cmd", "powershell", "pwsh",
+}
+
+
 def resolve_allowed_path(path: str, workspace_root: Path) -> Path:
     workspace_root = workspace_root.resolve()
     candidate = Path(path)
@@ -106,6 +116,7 @@ def run_command(
     workspace_root: Path | None = None,
     timeout: int = 30,
     env: dict[str, str] | None = None,
+    allowed_commands: set[str] | None = None,
 ) -> dict[str, Any]:
     if workspace_root is None:
         raise ValueError("workspace_root is required for command execution")
@@ -118,20 +129,35 @@ def run_command(
 
     if not argv:
         raise ValueError("Command must not be empty")
+    executable = Path(argv[0]).name.lower()
+    if executable.endswith(".exe"):
+        executable = executable[:-4]
+    allowlist = allowed_commands if allowed_commands is not None else DEFAULT_COMMAND_ALLOWLIST
+    if executable.lower() not in {name.lower() for name in allowlist}:
+        raise PermissionError(f"Executable is not allowed: {argv[0]}")
 
     execution_env = dict(__import__("os").environ)
     if env:
         execution_env.update(env)
 
-    completed = subprocess.run(
-        argv,
-        cwd=str(resolved_cwd),
-        env=execution_env,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        check=False,
-    )
+    try:
+        completed = subprocess.run(
+            argv,
+            cwd=str(resolved_cwd),
+            env=execution_env,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "returncode": None,
+            "stdout": exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or ""),
+            "stderr": exc.stderr.decode("utf-8", errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or ""),
+            "cwd": str(resolved_cwd.relative_to(workspace_root.resolve())),
+            "timed_out": True,
+        }
 
     return {
         "returncode": completed.returncode,
