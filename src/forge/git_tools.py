@@ -45,3 +45,16 @@ class GitCheckpointManager:
             return {"status": "error", "error": f"Checkpoint {checkpoint!r} not found."}
 
         return {"status": "ok", "checkpoint": checkpoint}
+
+    def status(self) -> dict[str, Any]:
+        result = self._git("status", "--short", "--branch")
+        return {"status": "ok", "output": result.stdout}
+
+    def diff(self, paths: list[str] | None = None, staged: bool = False) -> dict[str, Any]:
+        args = ["diff"]
+        if staged:
+            args.append("--cached")
+        if paths:
+            args.extend(["--", *paths])
+        result = self._git(*args)
+        return {"status": "ok", "output": result.stdout}

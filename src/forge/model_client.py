@@ -64,7 +64,7 @@ class OpenRouterClient:
 
         payload = self.build_payload(messages, tools)
         headers = {
-            "Authorization": f"Bearer {self.api_key}",
+            "Authorization": "Bearer " + self.api_key,
             "Content-Type": "application/json",
         }
         if self.site_url:
@@ -95,9 +95,13 @@ class OpenRouterClient:
                     for call in normalized.tool_calls
                 ],
                 "finish_reason": normalized.finish_reason,
+                "usage": normalized.usage.__dict__ if normalized.usage else None,
             }
 
-        return {"final_answer": normalized.message or "OpenRouter returned no final answer."}
+        return {
+            "final_answer": normalized.message or "OpenRouter returned no final answer.",
+            "usage": normalized.usage.__dict__ if normalized.usage else None,
+        }
 
     def _mock_response_for_tests(
         self,
@@ -170,7 +174,7 @@ class OpenRouterClient:
                 part.get("text", "") for part in content if isinstance(part, dict)
             )
 
-        usage = message.get("usage")
+        usage = choices[0].get("usage") or raw_response.get("usage")
         token_usage = None
         if isinstance(usage, dict):
             prompt_tokens = usage.get("prompt_tokens", 0)

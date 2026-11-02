@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import argparse
 
 from .agent import AgentLoop
 from .config import Settings
@@ -11,6 +12,8 @@ from .planning import PlanManager
 from .repo_inspector import RepositoryInspector
 from .tool_dispatcher import ToolDispatcher
 from .tool_registry import ToolDefinition, ToolRegistry
+from .observability import RunRecorder
+from .memory import ForgeDatabase, RepositoryIndex, WorkspaceMemory, compact_messages
 from .tools.filesystem import create_file, edit_file, list_files, read_file, replace_file, run_command, search_files
 
 
@@ -48,6 +51,12 @@ def build_registry(workspace_root: Path) -> ToolRegistry:
             timeout=timeout,
         )
 
+    def guarded_git_status() -> dict[str, object]:
+        return GitCheckpointManager(workspace_root).status()
+
+    def guarded_git_diff(paths: list[str] | None = None, staged: bool = False) -> dict[str, object]:
+        return GitCheckpointManager(workspace_root).diff(paths=paths, staged=staged)
+
     def guarded_create_plan(task: str) -> dict[str, object]:
         manager = PlanManager(task)
         manager.add_step("inspect repository")
@@ -74,6 +83,33 @@ def build_registry(workspace_root: Path) -> ToolRegistry:
                 "required": ["path"],
             },
             handler=guarded_list_files,
+            permission="read",
+            risk="low",
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="git_status",
+            description="Show the concise Git status and branch information for the workspace.",
+            arguments_schema={"type": "object", "properties": {}, "required": []},
+            handler=guarded_git_status,
+            permission="read",
+            risk="low",
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="git_diff",
+            description="Show unstaged or staged Git changes for the workspace.",
+            arguments_schema={
+                "type": "object",
+                "properties": {
+                    "paths": {"type": "array"},
+                    "staged": {"type": "boolean"},
+                },
+                "required": [],
+            },
+            handler=guarded_git_diff,
             permission="read",
             risk="low",
         )
@@ -242,16 +278,46 @@ def build_registry(workspace_root: Path) -> ToolRegistry:
     return registry
 
 
-def main() -> None:
-    task = input("forge> ")
-    workspace = Path.cwd().resolve()
+def _approval_prompt(tool_name: str, arguments: dict[str, object]) -> bool:
+    print(f"\nApproval requested for {tool_name}:")
+    print(arguments)
+    while True:
+        answer = input("Approve this tool call? [y/N/a=approve all] ").strip().lower()
+        if answer in {"y", "yes"}:
+            return True
+        if answer == "a":
+            return True
+        if answer in {"n", "no", ""}:
+            return False
+
+
+def _show_progress(event: str, data: dict[str, object]) -> None:
+    if event == "tool_retry":
+        print(f"[retry] {data.get('name')} attempt {data.get('attempt')}: {data.get('reason')}")
+    elif event == "tool_result":
+        print(f"[tool] {data.get('name')}: {data.get('status')}")
+    elif event == "task_completed":
+        print(f"[done] completed in {float(data.get('elapsed_seconds', 0)):.2f}s")
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(prog="forge", description="Run the Forge coding agent")
+    parser.add_argument("task", nargs="*", help="One-shot task text")
+    parser.add_argument("-w", "--workspace", default=".", help="Workspace directory")
+    parser.add_argument("--resume", help="Resume a persisted session ID")
+    parser.add_argument("--no-parallel-tools", action="store_true", help="Disable parallel tool execution")
+    args = parser.parse_args(argv)
+
+    workspace = Path(args.workspace).resolve()
+    if not workspace.exists():
+        parser.error(f"Workspace does not exist: {workspace}")
     settings = Settings(
         workspace_root=workspace,
         provider="openrouter",
         model_name="openai/gpt-4o-mini",
     )
     registry = build_registry(workspace)
-    dispatcher = ToolDispatcher(registry)
+    dispatcher = ToolDispatcher(registry, approval_handler=_approval_prompt)
     model_client = OpenRouterClient(
         api_key=settings.api_key,
         model=settings.model_name,
@@ -267,14 +333,127 @@ def main() -> None:
         max_steps=settings.max_steps,
         max_tool_calls=settings.max_tool_calls,
         debug=settings.debug,
+        parallel_tools=not args.no_parallel_tools,
+        observability=RunRecorder(workspace),
+        event_callback=_show_progress,
     )
+    store = SessionStore(workspace / ".forge_sessions")
+    workspace_memory = WorkspaceMemory(workspace)
+    database = ForgeDatabase(workspace)
+    repository_index = RepositoryIndex(workspace)
+    repository_index.rebuild()
+    history: list[str] = []
+    active_session: str | None = args.resume
+    previous_messages: list[dict[str, object]] = []
+    session_summary = ""
 
-    result = loop.run(task)
-    print("\n=== Forge result ===")
-    print(result.final_answer or "No final answer was produced.")
-    if result.last_error:
-        print(f"Last error: {result.last_error}")
-    print(f"Workspace: {workspace}")
+    def summarize_messages(messages: list[dict[str, object]]) -> str:
+        user_tasks = [
+            str(message.get("content", ""))[:500]
+            for message in messages
+            if message.get("role") == "user"
+        ]
+        tool_results = sum(message.get("role") == "tool" for message in messages)
+        return (
+            f"Tasks: {' | '.join(user_tasks[-3:])}. "
+            f"{tool_results} tool result(s) recorded in this session."
+        )
+
+    def make_plan_data(result: object) -> dict[str, object]:
+        plan = getattr(result, "plan", {}) or {}
+        if plan:
+            return plan
+        return loop.plan_manager.to_dict()
+
+    def execute(task_text: str) -> None:
+        nonlocal active_session, previous_messages, session_summary
+        initial_messages = []
+        if previous_messages:
+            initial_messages.append({
+                "role": "system",
+                "content": f"Previous session summary: {session_summary}",
+            })
+            initial_messages.extend(previous_messages[-12:])
+        loop.initial_messages = initial_messages
+        result = loop.run(task_text)
+        result_state = {
+            "messages": result.messages,
+            "summary": summarize_messages(result.messages),
+            "usage": result.usage,
+            "elapsed_seconds": result.elapsed_seconds,
+            "tool_retries": result.tool_retries,
+            "plan": make_plan_data(result),
+            "side_effects": [],
+        }
+        if active_session:
+            saved = store.update_session(active_session, result_state)
+            session_id = active_session
+        else:
+            session_id = store.create_session(task_text, result_state)
+            active_session = session_id
+        database.save_session(
+            session_id,
+            task_text,
+            result_state["summary"],
+            result.messages,
+            make_plan_data(result),
+            result.usage,
+        )
+        previous_messages = result.messages
+        session_summary = str(result_state["summary"])
+        database.add_episode(
+            session_id,
+            task_text,
+            "completed" if not result.last_error else "completed_with_errors",
+            result.final_answer or "",
+        )
+        history.append(task_text)
+        print("\n=== Forge result ===")
+        print(result.final_answer or "No final answer was produced.")
+        if result.last_error:
+            print(f"Last error: {result.last_error}")
+        print(f"Tokens: {result.usage.get('total_tokens', 0)} | Time: {result.elapsed_seconds:.2f}s | Session: {session_id}")
+        print(f"Workspace: {workspace}")
+
+    if args.resume:
+        session = store.resume_session(args.resume)
+        print(f"Resumed session {args.resume}: {session['task']}")
+        saved_state = session.get("state", {})
+        previous_messages = saved_state.get("messages", [])[-12:]
+        session_summary = saved_state.get("summary", "")
+        print(f"Summary: {session_summary or 'No prior summary stored.'}")
+        execute(session["task"])
+        return
+
+    if args.task:
+        execute(" ".join(args.task))
+        return
+
+    print(f"Forge workspace: {workspace}")
+    print("Commands: /help, /status, /sessions, /history, /exit")
+    while True:
+        try:
+            task = input("forge> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if not task:
+            continue
+        if task in {"/exit", "/quit"}:
+            return
+        if task == "/help":
+            print("Enter a coding task, or use /status, /sessions, /history, /exit.")
+            continue
+        if task == "/status":
+            print(GitCheckpointManager(workspace).status()["output"])
+            continue
+        if task == "/sessions":
+            print("\n".join(store.list_sessions()) or "No sessions.")
+            continue
+        if task == "/history":
+            print("\n".join(f"{index + 1}. {item}" for index, item in enumerate(history)) or "No task history.")
+            continue
+        execute(task)
 
 
 if __name__ == "__main__":
