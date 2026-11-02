@@ -55,6 +55,24 @@ class ToolDispatcher:
 
         return None
 
+    def validate_arguments(self, schema: dict[str, Any], arguments: dict[str, Any]) -> str | None:
+        if not isinstance(schema, dict):
+            return None
+
+        required_fields = schema.get("required", [])
+        for field_name in required_fields:
+            if field_name not in arguments:
+                return f"Missing required argument: {field_name}"
+
+        for field_name, field_spec in (schema.get("properties") or {}).items():
+            if field_name not in arguments:
+                continue
+            expected_type = field_spec.get("type") if isinstance(field_spec, dict) else None
+            if expected_type and not _matches_type(expected_type, arguments[field_name]):
+                return f"Argument '{field_name}' must match type {expected_type}"
+
+        return None
+
     def execute(self, tool_call: dict[str, Any]) -> dict[str, Any]:
         name = tool_call.get("name")
         arguments = tool_call.get("arguments", {})
