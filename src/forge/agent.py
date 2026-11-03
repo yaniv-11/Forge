@@ -27,6 +27,9 @@ class AgentState:
     elapsed_seconds: float = 0.0
     tool_retries: int = 0
     plan: dict[str, Any] = field(default_factory=dict)
+    modified_files: list[str] = field(default_factory=list)
+    commands: list[str] = field(default_factory=list)
+    side_effects: list[str] = field(default_factory=list)
 
 
 class AgentLoop:
@@ -48,6 +51,7 @@ class AgentLoop:
         event_callback: Callable[[str, dict[str, Any]], None] | None = None,
         initial_messages: list[dict[str, Any]] | None = None,
         max_context_tokens: int = 19000,
+        memory_context_provider: Callable[[str], str] | None = None,
     ) -> None:
         self.model_client = model_client
         self.tool_registry = tool_registry
@@ -63,6 +67,7 @@ class AgentLoop:
         self.event_callback = event_callback
         self.initial_messages = initial_messages
         self.max_context_tokens = max_context_tokens
+        self.memory_context_provider = memory_context_provider
 
     def _emit(self, event: str, data: dict[str, Any]) -> None:
         if self.event_callback:
@@ -86,7 +91,10 @@ class AgentLoop:
         state = AgentState(task=safe_task)
         if self.initial_messages:
             state.messages.extend(self.initial_messages)
-        state.messages.extend(self.prompt_builder.build_messages(safe_task))
+        memory_context = ""
+        if self.memory_context_provider:
+            memory_context = self.memory_context_provider(safe_task)
+        state.messages.extend(self.prompt_builder.build_messages(safe_task, memory_context))
         state.messages = compact_messages(state.messages, self.max_context_tokens)
 
         while state.steps < self.max_steps:
@@ -174,6 +182,15 @@ class AgentLoop:
                 self._emit("tool_result", {"name": tool_call.get("name"), "status": tool_result.get("status")})
                 if tool_result.get("status") == "error":
                     state.last_error = tool_result.get("error", "tool execution failed")
+                if tool_result.get("status") == "ok":
+                    tool_name = str(tool_call.get("name", ""))
+                    arguments = tool_call.get("arguments", {}) or {}
+                    if tool_name in {"create_file", "replace_file", "edit_file", "write_file"} and isinstance(arguments.get("path"), str):
+                        state.modified_files.append(arguments["path"])
+                        state.side_effects.append(tool_name)
+                    if tool_name == "run_command":
+                        command = arguments.get("command")
+                        state.commands.append(command if isinstance(command, str) else json.dumps(command))
 
             if state.tool_calls >= self.max_tool_calls:
                 state.final_answer = "Execution stopped because the tool call limit was reached."
