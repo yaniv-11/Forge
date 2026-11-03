@@ -174,8 +174,14 @@ def main(argv: list[str] | None = None) -> None:
         loop.plan_manager = PlanManager(session["task"])
         loop.plan_manager.plan.objective = session["task"]
         for step in plan_state.get("steps", []):
-            if step.get("status") != "done":
-                loop.plan_manager.add_step(str(step.get("name", "continue task")))
+            loop.plan_manager.add_step(
+                str(step.get("name", "continue task")),
+                str(step.get("verification", "")),
+                [str(value) for value in step.get("depends_on", [])],
+            )
+            restored = loop.plan_manager.plan.steps[-1]
+            restored.status = str(step.get("status", "pending"))
+            restored.notes = str(step.get("notes", ""))
         pending_steps = [
             step["name"] for step in loop.plan_manager.plan.steps
             if step.status != "done"
