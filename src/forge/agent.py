@@ -217,6 +217,18 @@ class AgentLoop:
                 if tool_result.get("status") == "ok":
                     tool_name = str(tool_call.get("name", ""))
                     arguments = tool_call.get("arguments", {}) or {}
+                    nested = tool_result.get("result")
+                    command_failed = (
+                        tool_name == "run_command"
+                        and isinstance(nested, dict)
+                        and nested.get("returncode") not in {0}
+                    )
+                    if command_failed:
+                        state.last_error = nested.get("error") or nested.get("stderr") or "Command execution failed."
+                        state.blockers.append(state.last_error)
+                        state.uncertainty.append(state.last_error)
+                    else:
+                        state.last_error = None
                     if tool_name == "plan_task":
                         state.transition_phase(
                             AgentPhase.INVESTIGATION,
@@ -234,7 +246,7 @@ class AgentLoop:
                         )
                     elif tool_name == "run_command":
                         nested = tool_result.get("result")
-                        if not isinstance(nested, dict) or nested.get("returncode") in {None, 0}:
+                        if isinstance(nested, dict) and nested.get("returncode") == 0:
                             state.transition_phase(
                                 AgentPhase.VERIFICATION,
                                 "A command produced verification evidence.",
