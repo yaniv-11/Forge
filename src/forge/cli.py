@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 import argparse
+import json
+import os
+import sys
 
 from .agent import AgentLoop
 from .config import Settings
@@ -15,11 +18,60 @@ from .observability import RunRecorder
 from .memory import ForgeDatabase, RepositoryIndex, WorkspaceMemory, compact_messages
 
 
+def _use_color() -> bool:
+    return (
+        sys.stdout.isatty()
+        and os.getenv("NO_COLOR") is None
+        and os.getenv("TERM") != "dumb"
+    )
+
+
+if _use_color():
+    C_RESET = "\033[0m"
+    C_BOLD = "\033[1m"
+    C_DIM = "\033[2m"
+    C_CYAN = "\033[36m"
+    C_GREEN = "\033[32m"
+    C_YELLOW = "\033[33m"
+    C_RED = "\033[31m"
+else:
+    C_RESET = C_BOLD = C_DIM = C_CYAN = C_GREEN = C_YELLOW = C_RED = ""
+
+
+def _style(text: object, color: str) -> str:
+    return f"{color}{text}{C_RESET}" if color else str(text)
+
+
+def _print_box(title: str, body: object, color: str = C_CYAN, width: int = 88) -> None:
+    lines = str(body).expandtabs(4).splitlines() or [""]
+    print()
+    print(_style(f" {title} ".center(width, "="), C_BOLD + color))
+    for line in lines:
+        print(line)
+    print(_style("=" * width, color))
+
+
+def _print_banner(workspace: Path) -> None:
+    print()
+    print(_style("  F O R G E", C_BOLD + C_CYAN))
+    print(_style("  Workspace", C_DIM), workspace)
+    print()
+    print(_style("  Commands", C_BOLD), "/help  /status  /sessions  /history  /exit")
+    print(_style("  " + "-" * 84, C_DIM))
+
+
+def _print_section(title: str) -> None:
+    print()
+    print(_style(f" {title} ", C_BOLD + C_CYAN))
+    print(_style("-" * (len(title) + 2), C_DIM))
+
+
 def _approval_prompt(tool_name: str, arguments: dict[str, object]) -> bool:
-    print(f"\nApproval requested for {tool_name}:")
-    print(arguments)
+    print()
+    print(_style(f" Approval requested: {tool_name} ", C_BOLD + C_YELLOW))
+    print(json.dumps(arguments, indent=2, ensure_ascii=False))
     while True:
-        answer = input("Approve this tool call? [y/N/a=approve all] ").strip().lower()
+        answer = input(_style("Approve this tool call? [y/N/a=approve all] ", C_BOLD)).strip().lower()
         if answer in {"y", "yes"}:
             return True
         if answer == "a":
@@ -30,11 +82,14 @@ def _approval_prompt(tool_name: str, arguments: dict[str, object]) -> bool:
 
 def _show_progress(event: str, data: dict[str, object]) -> None:
     if event == "tool_retry":
-        print(f"[retry] {data.get('name')} attempt {data.get('attempt')}: {data.get('reason')}")
+        print(_style("  ↻ retry", C_YELLOW), f"{data.get('name')} attempt {data.get('attempt')}  {C_DIM}{data.get('reason')}{C_RESET}")
     elif event == "tool_result":
-        print(f"[tool] {data.get('name')}: {data.get('status')}")
+        status = str(data.get("status"))
+        marker = "✓" if status == "ok" else "✗"
+        color = C_GREEN if status == "ok" else C_RED
+        print(_style(f"  {marker} tool", color), data.get("name"))
     elif event == "task_completed":
-        print(f"[done] completed in {float(data.get('elapsed_seconds', 0)):.2f}s")
+        print(_style("  ✓ completed", C_GREEN), f"in {float(data.get('elapsed_seconds', 0)):.2f}s")
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -117,9 +172,22 @@ def main(argv: list[str] | None = None) -> None:
                 "role": "system",
                 "content": f"Previous session summary: {session_summary}",
             })
-            initial_messages.extend(previous_messages[-12:])
+            recent_messages = previous_messages[-12:]
+            while recent_messages and recent_messages[0].get("role") == "tool":
+                recent_messages = recent_messages[1:]
+            while recent_messages and recent_messages[-1].get("role") == "tool":
+                recent_messages.pop()
+                if recent_messages and recent_messages[-1].get("role") == "assistant":
+                    recent_messages.pop()
+            while recent_messages and recent_messages[-1].get("role") == "assistant" and recent_messages[-1].get("tool_calls"):
+                recent_messages.pop()
+            initial_messages.extend(recent_messages)
         loop.initial_messages = initial_messages
-        result = loop.run(task_text)
+        try:
+            result = loop.run(task_text)
+        except RuntimeError as exc:
+            _print_box("Forge error", str(exc), color=C_RED)
+            return
         result_state = {
             "messages": result.messages,
             "summary": summarize_messages(result.messages),
@@ -167,20 +235,25 @@ def main(argv: list[str] | None = None) -> None:
             result.commands,
         )
         history.append(task_text)
-        print("\n=== Forge result ===")
-        print(result.final_answer or "No final answer was produced.")
+        _print_box("Forge result", result.final_answer or "No final answer was produced.")
         if result.last_error:
-            print(f"Last error: {result.last_error}")
-        print(f"Tokens: {result.usage.get('total_tokens', 0)} | Time: {result.elapsed_seconds:.2f}s | Session: {session_id}")
-        print(f"Workspace: {workspace}")
+            print(_style("  ! Last error:", C_YELLOW), result.last_error)
+        print(
+            _style("  Summary ", C_BOLD),
+            f"{result.usage.get('total_tokens', 0)} tokens  ·  "
+            f"{result.elapsed_seconds:.2f}s  ·  session {session_id}",
+        )
+        print(_style("  Workspace", C_DIM), workspace)
 
     if args.resume:
         session = store.resume_session(args.resume)
-        print(f"Resumed session {args.resume}: {session['task']}")
+        _print_section("Resumed session")
+        print(_style("  ID", C_BOLD), args.resume)
+        print(_style("  Task", C_BOLD), session["task"])
         saved_state = session.get("state", {})
         previous_messages = saved_state.get("messages", [])[-12:]
         session_summary = saved_state.get("summary", "")
-        print(f"Summary: {session_summary or 'No prior summary stored.'}")
+        print(_style("  Summary", C_BOLD), session_summary or "No prior summary stored.")
         plan_state = saved_state.get("plan") or {}
         loop.plan_manager = PlanManager(session["task"])
         loop.plan_manager.plan.objective = session["task"]
@@ -211,29 +284,36 @@ def main(argv: list[str] | None = None) -> None:
         execute(" ".join(args.task))
         return
 
-    print(f"Forge workspace: {workspace}")
-    print("Commands: /help, /status, /sessions, /history, /exit")
+    _print_banner(workspace)
     while True:
         try:
-            task = input("forge> ").strip()
+            task = input(_style("forge ", C_BOLD + C_CYAN) + _style("› ", C_DIM)).strip()
         except (EOFError, KeyboardInterrupt):
             print()
             return
         if not task:
             continue
-        if task in {"/exit", "/quit"}:
+        if task.lower() in {"exit", "quit", "bye", "/exit", "/quit"}:
             return
         if task == "/help":
-            print("Enter a coding task, or use /status, /sessions, /history, /exit.")
+            _print_section("Commands")
+            print("  Enter a coding task.")
+            print("  /status     Show repository status")
+            print("  /sessions   List saved sessions")
+            print("  /history    Show tasks from this session")
+            print("  /exit       Leave Forge")
             continue
-        if task == "/status":
+        if task.lower() in {"/status", "/git-status"}:
+            _print_section("Repository status")
             print(GitCheckpointManager(workspace).status()["output"])
             continue
         if task == "/sessions":
-            print("\n".join(store.list_sessions()) or "No sessions.")
+            _print_section("Sessions")
+            print("\n".join(f"  {item}" for item in store.list_sessions()) or "  No sessions.")
             continue
         if task == "/history":
-            print("\n".join(f"{index + 1}. {item}" for index, item in enumerate(history)) or "No task history.")
+            _print_section("Task history")
+            print("\n".join(f"  {index + 1}. {item}" for index, item in enumerate(history)) or "  No task history.")
             continue
         execute(task)
 
