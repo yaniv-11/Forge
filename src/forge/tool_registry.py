@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from functools import partial
+from inspect import signature
 from typing import Any, Callable
 
 
@@ -49,3 +51,53 @@ class ToolRegistry:
             }
             for tool in self.list_tools()
         ]
+
+    def register_decorated(self, handler: Callable[..., Any], **context: Any) -> None:
+        definition = getattr(handler, "__forge_tool__", None)
+        if definition is None:
+            raise ValueError(f"{handler.__name__!r} is not a registered tool handler.")
+
+        bound_handler = handler
+        context_parameters = {
+            name: value
+            for name, value in context.items()
+            if name in signature(handler).parameters
+        }
+        if context_parameters:
+            bound_handler = partial(handler, **context_parameters)
+
+        self.register(ToolDefinition(
+            name=definition.name,
+            description=definition.description,
+            arguments_schema=definition.arguments_schema,
+            handler=bound_handler,
+            permission=definition.permission,
+            risk=definition.risk,
+            approval_required=definition.approval_required,
+        ))
+
+
+def forge_tool(
+    name: str,
+    description: str,
+    arguments_schema: dict[str, Any],
+    permission: str = "read",
+    risk: str = "low",
+    approval_required: bool = False,
+) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """Attach tool metadata to a callable."""
+
+    def decorate(handler: Callable[..., Any]) -> Callable[..., Any]:
+        definition = ToolDefinition(
+            name=name,
+            description=description,
+            arguments_schema=arguments_schema,
+            handler=handler,
+            permission=permission,
+            risk=risk,
+            approval_required=approval_required,
+        )
+        setattr(handler, "__forge_tool__", definition)
+        return handler
+
+    return decorate
