@@ -7,6 +7,7 @@ from ..git_tools import GitCheckpointManager
 from ..persistence import SessionStore
 from ..planning import PlanManager
 from ..repo_inspector import RepositoryInspector
+from ..memory import ForgeDatabase
 from ..tool_registry import ToolRegistry, forge_tool
 from .filesystem import (
     create_file as create_workspace_file,
@@ -205,6 +206,28 @@ def plan_task(task: str) -> dict[str, Any]:
 
 
 @forge_tool(
+    name="remember_workspace",
+    description="Store durable workspace knowledge for use in future tasks.",
+    arguments_schema={
+        "type": "object",
+        "properties": {
+            "key": {"type": "string"},
+            "value": {"type": "string"},
+            "category": {"type": "string"},
+        },
+        "required": ["key", "value"],
+    },
+)
+def remember_workspace(
+    key: str,
+    value: str,
+    category: str = "fact",
+    workspace_root: Path | None = None,
+) -> dict[str, Any]:
+    return ForgeDatabase(workspace_root).remember(key, value, category)
+
+
+@forge_tool(
     name="create_checkpoint",
     description="Create a conservative Git checkpoint for the current workspace before risky edits or recovery actions.",
     arguments_schema={
@@ -245,6 +268,7 @@ TOOLS = (
     git_diff,
     inspect_repo,
     plan_task,
+    remember_workspace,
     create_checkpoint,
     resume_session,
 )

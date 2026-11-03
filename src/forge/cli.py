@@ -7,6 +7,7 @@ from .agent import AgentLoop
 from .config import Settings
 from .git_tools import GitCheckpointManager
 from .model_client import OpenRouterClient
+from .planning import PlanManager
 from .persistence import SessionStore
 from .tool_dispatcher import ToolDispatcher
 from .tools.registry import build_registry
@@ -72,6 +73,13 @@ def main(argv: list[str] | None = None) -> None:
         parallel_tools=not args.no_parallel_tools,
         observability=RunRecorder(workspace),
         event_callback=_show_progress,
+        memory_context_provider=lambda task: "\n\n".join(
+            part for part in (
+                workspace_memory.prompt_context(),
+                repository_index.prompt_context(task),
+                database.memory_prompt_context(),
+            ) if part
+        ),
     )
     store = SessionStore(workspace / ".forge_sessions")
     workspace_memory = WorkspaceMemory(workspace)
@@ -101,7 +109,7 @@ def main(argv: list[str] | None = None) -> None:
             return plan
         return loop.plan_manager.to_dict()
 
-    def execute(task_text: str) -> None:
+    def execute(task_text: str, stored_task: str | None = None) -> None:
         nonlocal active_session, previous_messages, session_summary
         initial_messages = []
         if previous_messages:
@@ -119,7 +127,9 @@ def main(argv: list[str] | None = None) -> None:
             "elapsed_seconds": result.elapsed_seconds,
             "tool_retries": result.tool_retries,
             "plan": make_plan_data(result),
-            "side_effects": [],
+            "modified_files": result.modified_files,
+            "commands": result.commands,
+            "side_effects": result.side_effects,
         }
         if active_session:
             saved = store.update_session(active_session, result_state)
@@ -127,21 +137,23 @@ def main(argv: list[str] | None = None) -> None:
         else:
             session_id = store.create_session(task_text, result_state)
             active_session = session_id
+        previous_messages = result.messages
+        session_summary = str(result_state["summary"])
         database.save_session(
             session_id,
-            task_text,
+            stored_task or task_text,
             result_state["summary"],
             result.messages,
             make_plan_data(result),
             result.usage,
         )
-        previous_messages = result.messages
-        session_summary = str(result_state["summary"])
         database.add_episode(
             session_id,
-            task_text,
+            stored_task or task_text,
             "completed" if not result.last_error else "completed_with_errors",
             result.final_answer or "",
+            result.modified_files,
+            result.commands,
         )
         history.append(task_text)
         print("\n=== Forge result ===")
@@ -158,7 +170,24 @@ def main(argv: list[str] | None = None) -> None:
         previous_messages = saved_state.get("messages", [])[-12:]
         session_summary = saved_state.get("summary", "")
         print(f"Summary: {session_summary or 'No prior summary stored.'}")
-        execute(session["task"])
+        plan_state = saved_state.get("plan") or {}
+        loop.plan_manager = PlanManager(session["task"])
+        loop.plan_manager.plan.objective = session["task"]
+        for step in plan_state.get("steps", []):
+            if step.get("status") != "done":
+                loop.plan_manager.add_step(str(step.get("name", "continue task")))
+        pending_steps = [
+            step["name"] for step in loop.plan_manager.plan.steps
+            if step.status != "done"
+        ]
+        continuation = session["task"]
+        if pending_steps:
+            continuation = (
+                f"Continue the original task: {session['task']}\n"
+                "Resume from these pending plan steps:\n- "
+                + "\n- ".join(pending_steps)
+            )
+        execute(continuation, stored_task=session["task"])
         return
 
     if args.task:

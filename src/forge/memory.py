@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import json
+import re
 import sqlite3
 import time
 from pathlib import Path
@@ -35,12 +36,28 @@ def compact_messages(messages: list[dict[str, Any]], max_tokens: int = 12000) ->
     kept.reverse()
 
     compact_count = len(non_system) - len(kept)
+    omitted = non_system[:compact_count]
+    details: list[str] = []
+    for message in omitted:
+        text = str(message.get("content", "")).strip()
+        if not text:
+            continue
+        for line in text.splitlines():
+            stripped = line.strip()
+            if (
+                stripped.startswith(("Task:", "Files:", "Commands:", "Failed:", "Error:", "file "))
+                or "Traceback" in stripped
+                or ".py" in stripped
+                or ".ts" in stripped
+            ):
+                details.append(stripped[:300])
+    detail_text = " Key details:" + " ".join(details[-12:]) if details else ""
     summary = {
         "role": "system",
         "content": (
             f"Compacted session summary: {compact_count} earlier message(s) omitted. "
             "Preserve the original task objective, completed changes, failed commands, "
-            "and files that still need verification."
+            "and files that still need verification." + detail_text
         ),
     }
     return system + [summary] + kept
@@ -77,6 +94,22 @@ class WorkspaceMemory:
         memory = self.load()
         memory.setdefault("conventions", {})[key] = value
         self.save(memory)
+
+    def prompt_context(self) -> str:
+        memory = self.load()
+        sections = []
+        for title, key in (
+            ("Workspace facts", "facts"),
+            ("Workspace conventions", "conventions"),
+        ):
+            values = memory.get(key, {})
+            if values:
+                sections.append(f"{title}: {json.dumps(values, sort_keys=True)}")
+        for key in ("entrypoints", "test_commands", "known_failures"):
+            values = memory.get(key, [])
+            if values:
+                sections.append(f"{key.replace('_', ' ').title()}: {json.dumps(values)}")
+        return "\n".join(sections)
 
 
 class ForgeDatabase:
@@ -128,6 +161,16 @@ class ForgeDatabase:
                 UNIQUE(path, kind, name, line)
             );
             CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
+            CREATE TABLE IF NOT EXISTS memories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                scope TEXT NOT NULL DEFAULT 'workspace',
+                category TEXT NOT NULL,
+                key TEXT NOT NULL,
+                value TEXT NOT NULL,
+                source_session TEXT,
+                updated_at REAL NOT NULL,
+                UNIQUE(scope, category, key)
+            );
             """
         )
         self.connection.commit()
@@ -223,6 +266,49 @@ class ForgeDatabase:
     def close(self) -> None:
         self.connection.close()
 
+    def remember(
+        self,
+        key: str,
+        value: str,
+        category: str = "fact",
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
+        self.connection.execute(
+            """
+            INSERT INTO memories(scope, category, key, value, source_session, updated_at)
+            VALUES ('workspace', ?, ?, ?, ?, ?)
+            ON CONFLICT(scope, category, key) DO UPDATE SET
+                value=excluded.value,
+                source_session=excluded.source_session,
+                updated_at=excluded.updated_at
+            """,
+            (category, key, value, session_id, time.time()),
+        )
+        self.connection.commit()
+        return {"key": key, "value": value, "category": category}
+
+    def recall(self, limit: int = 50, category: str | None = None) -> list[dict[str, Any]]:
+        if category:
+            rows = self.connection.execute(
+                "SELECT category, key, value FROM memories WHERE category=? ORDER BY updated_at DESC LIMIT ?",
+                (category, limit),
+            ).fetchall()
+        else:
+            rows = self.connection.execute(
+                "SELECT category, key, value FROM memories ORDER BY updated_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def memory_prompt_context(self, limit: int = 50) -> str:
+        memories = self.recall(limit=limit)
+        if not memories:
+            return ""
+        return "Long-term workspace memories:\n" + "\n".join(
+            f"- [{memory['category']}] {memory['key']}: {memory['value']}"
+            for memory in memories
+        )
+
 
 class RepositoryIndex:
     _IGNORED_PARTS = {".git", ".forge", ".forge_sessions", ".venv", "__pycache__", "node_modules"}
@@ -285,6 +371,45 @@ class RepositoryIndex:
             (f"%{query.lower()}%", limit),
         ).fetchall()
         return [dict(row) for row in rows]
+
+    def prompt_context(self, task: str, limit_files: int = 8, limit_symbols: int = 20) -> str:
+        words = {
+            word.lower()
+            for word in re.findall(r"[A-Za-z0-9_]+", task)
+            if len(word) > 2
+        }
+        if not words:
+            return ""
+        placeholders = ",".join("?" for _ in words)
+        parameters: list[Any] = [f"%{word}%" for word in words]
+        rows = self.database.connection.execute(
+            f"""
+            SELECT path FROM repository_files
+            WHERE {' OR '.join('lower(path) LIKE ?' for _ in words)}
+            LIMIT {limit_files}
+            """,
+            parameters,
+        ).fetchall()
+        symbol_rows = self.database.connection.execute(
+            f"""
+            SELECT path, kind, name, line, signature FROM symbols
+            WHERE {' OR '.join('lower(name) LIKE ?' for _ in words)}
+            ORDER BY name LIMIT ?
+            """,
+            parameters + [limit_symbols],
+        ).fetchall()
+        sections = []
+        if rows:
+            sections.append("Repository files relevant to this task:\n- " + "\n- ".join(row["path"] for row in rows))
+        if symbol_rows:
+            sections.append(
+                "Relevant repository symbols:\n"
+                + "\n".join(
+                    f"- {row['path']}:{row['line']} {row['kind']} {row['name']}"
+                    for row in symbol_rows
+                )
+            )
+        return "\n".join(sections)
 
     def close(self) -> None:
         self.database.close()
