@@ -4,6 +4,7 @@ from pathlib import Path
 import argparse
 import json
 import os
+import subprocess
 import sys
 
 from .agent import AgentLoop
@@ -60,6 +61,21 @@ def _print_banner(workspace: Path) -> None:
     print(_style("  " + "-" * 84, C_DIM))
 
 
+def _print_workspace_preflight(workspace: Path) -> None:
+    _print_section("Workspace")
+    print(_style("  Path", C_BOLD), workspace)
+    git = GitCheckpointManager(workspace)
+    try:
+        status = git.status()
+    except (subprocess.CalledProcessError, OSError):
+        print(_style("  Git", C_DIM), "not available")
+        return
+    output = status["output"].strip()
+    print(_style("  Git", C_DIM), "repository" if output else "repository (clean)")
+    if output:
+        print(output)
+
+
 def _print_section(title: str) -> None:
     print()
     print(_style(f" {title} ", C_BOLD + C_CYAN))
@@ -95,18 +111,22 @@ def _show_progress(event: str, data: dict[str, object]) -> None:
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="forge", description="Run the Forge coding agent")
     parser.add_argument("task", nargs="*", help="One-shot task text")
-    parser.add_argument("-w", "--workspace", default=".", help="Workspace directory")
+    parser.add_argument("-w", "--workspace", "--repo", dest="workspace", default=".", help="Workspace or repository directory")
     parser.add_argument("--resume", help="Resume a persisted session ID")
     parser.add_argument("--no-parallel-tools", action="store_true", help="Disable parallel tool execution")
+    parser.add_argument("--model", help="Override the OpenRouter model identifier")
+    parser.add_argument("--provider", help="Override the configured provider")
     args = parser.parse_args(argv)
 
-    workspace = Path(args.workspace).resolve()
+    workspace = Path(args.workspace).expanduser().resolve()
     if not workspace.exists():
         parser.error(f"Workspace does not exist: {workspace}")
+    if not workspace.is_dir():
+        parser.error(f"Workspace is not a directory: {workspace}")
     settings = Settings(
         workspace_root=workspace,
-        provider="openrouter",
-        model_name="openai/gpt-4o-mini",
+        provider=args.provider,
+        model_name=args.model,
     )
     registry = build_registry(workspace)
     dispatcher = ToolDispatcher(registry, approval_handler=_approval_prompt)
@@ -281,10 +301,12 @@ def main(argv: list[str] | None = None) -> None:
         return
 
     if args.task:
+        _print_workspace_preflight(workspace)
         execute(" ".join(args.task))
         return
 
     _print_banner(workspace)
+    _print_workspace_preflight(workspace)
     while True:
         try:
             task = input(_style("forge ", C_BOLD + C_CYAN) + _style("› ", C_DIM)).strip()
