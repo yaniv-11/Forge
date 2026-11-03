@@ -185,6 +185,14 @@ class AgentLoop:
                 if tool_result.get("status") == "ok":
                     tool_name = str(tool_call.get("name", ""))
                     arguments = tool_call.get("arguments", {}) or {}
+                    if tool_name == "plan_task":
+                        nested_plan = tool_result.get("result")
+                        if isinstance(nested_plan, dict) and isinstance(nested_plan.get("steps"), list):
+                            try:
+                                self.plan_manager.replace_plan(nested_plan["steps"])
+                            except ValueError as exc:
+                                state.last_error = str(exc)
+                    self.plan_manager.apply_tool_progress(tool_name, arguments, tool_result)
                     if tool_name in {"create_file", "replace_file", "edit_file", "write_file"} and isinstance(arguments.get("path"), str):
                         state.modified_files.append(arguments["path"])
                         state.side_effects.append(tool_name)

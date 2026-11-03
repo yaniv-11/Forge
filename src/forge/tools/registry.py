@@ -190,18 +190,35 @@ def inspect_repo(task: str, max_files: int = 10, workspace_root: Path | None = N
 
 @forge_tool(
     name="plan_task",
-    description="Create a lightweight execution plan with explicit steps and a bounded repair budget.",
+    description="Create or replace the execution plan with task-specific steps, dependencies, and verification.",
     arguments_schema={
         "type": "object",
-        "properties": {"task": {"type": "string"}},
+        "properties": {
+            "task": {"type": "string"},
+            "steps": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "verification": {"type": "string"},
+                        "depends_on": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["name"],
+                },
+            },
+        },
         "required": ["task"],
     },
 )
-def plan_task(task: str) -> dict[str, Any]:
+def plan_task(task: str, steps: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     manager = PlanManager(task)
-    manager.add_step("inspect repository")
-    manager.add_step("apply targeted fix")
-    manager.add_step("verify with tests")
+    if steps:
+        manager.replace_plan(steps)
+    else:
+        manager.add_step("inspect repository", "Relevant files are identified.")
+        manager.add_step("apply targeted fix", "The requested files are updated.", ["inspect repository"])
+        manager.add_step("verify with tests", "Relevant tests pass.", ["apply targeted fix"])
     return manager.to_dict()
 
 
