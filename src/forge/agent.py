@@ -47,7 +47,7 @@ class AgentLoop:
         observability: Any | None = None,
         event_callback: Callable[[str, dict[str, Any]], None] | None = None,
         initial_messages: list[dict[str, Any]] | None = None,
-        max_context_tokens: int = 12000,
+        max_context_tokens: int = 19000,
     ) -> None:
         self.model_client = model_client
         self.tool_registry = tool_registry
