@@ -130,6 +130,17 @@ def main(argv: list[str] | None = None) -> None:
             "modified_files": result.modified_files,
             "commands": result.commands,
             "side_effects": result.side_effects,
+            "phase": result.phase.value,
+            "phase_history": [
+                {
+                    "from_phase": transition.from_phase.value,
+                    "to_phase": transition.to_phase.value,
+                    "reason": transition.reason,
+                }
+                for transition in result.phase_history
+            ],
+            "uncertainty": result.uncertainty,
+            "blockers": result.blockers,
         }
         if active_session:
             saved = store.update_session(active_session, result_state)

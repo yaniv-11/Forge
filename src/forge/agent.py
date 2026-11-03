@@ -4,6 +4,7 @@ import concurrent.futures
 import json
 import time
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, Callable
 
 from .planning import PlanManager
@@ -11,6 +12,22 @@ from .prompts import PromptBuilder
 from .tool_dispatcher import ToolDispatcher
 from .tool_registry import ToolRegistry
 from .memory import compact_messages
+
+
+class AgentPhase(str, Enum):
+    PLANNING = "planning"
+    INVESTIGATION = "investigation"
+    IMPLEMENTATION = "implementation"
+    VERIFICATION = "verification"
+    COMPLETION = "completion"
+    FAILED = "failed"
+
+
+@dataclass
+class PhaseTransition:
+    from_phase: AgentPhase
+    to_phase: AgentPhase
+    reason: str
 
 
 @dataclass
@@ -30,6 +47,16 @@ class AgentState:
     modified_files: list[str] = field(default_factory=list)
     commands: list[str] = field(default_factory=list)
     side_effects: list[str] = field(default_factory=list)
+    phase: AgentPhase = AgentPhase.PLANNING
+    phase_history: list[PhaseTransition] = field(default_factory=list)
+    uncertainty: list[str] = field(default_factory=list)
+    blockers: list[str] = field(default_factory=list)
+
+    def transition_phase(self, phase: AgentPhase, reason: str) -> None:
+        if phase == self.phase:
+            return
+        self.phase_history.append(PhaseTransition(self.phase, phase, reason))
+        self.phase = phase
 
 
 class AgentLoop:
@@ -89,6 +116,7 @@ class AgentLoop:
             self.plan_manager.add_step("verify with tests")
 
         state = AgentState(task=safe_task)
+        self._emit("phase_changed", {"phase": state.phase.value, "reason": "agent started"})
         if self.initial_messages:
             state.messages.extend(self.initial_messages)
         memory_context = ""
@@ -117,6 +145,8 @@ class AgentLoop:
                 state.elapsed_seconds = time.monotonic() - started
                 self._emit("task_completed", {"elapsed_seconds": state.elapsed_seconds})
                 state.plan = self.plan_manager.to_dict()
+                state.transition_phase(AgentPhase.COMPLETION, "The model returned a verified final answer.")
+                self._emit("phase_changed", {"phase": state.phase.value, "reason": "verified final answer"})
                 return state
 
             tool_calls = response.get("tool_calls") or []
@@ -182,9 +212,35 @@ class AgentLoop:
                 self._emit("tool_result", {"name": tool_call.get("name"), "status": tool_result.get("status")})
                 if tool_result.get("status") == "error":
                     state.last_error = tool_result.get("error", "tool execution failed")
+                    state.blockers.append(state.last_error)
+                    state.uncertainty.append(state.last_error)
                 if tool_result.get("status") == "ok":
                     tool_name = str(tool_call.get("name", ""))
                     arguments = tool_call.get("arguments", {}) or {}
+                    if tool_name == "plan_task":
+                        state.transition_phase(
+                            AgentPhase.INVESTIGATION,
+                            "A task plan was created and repository investigation can begin.",
+                        )
+                    elif tool_name in {"inspect_repo", "list_files", "read_file", "search_files"}:
+                        state.transition_phase(
+                            AgentPhase.INVESTIGATION,
+                            f"{tool_name} supplied repository evidence.",
+                        )
+                    elif tool_name in {"create_file", "replace_file", "edit_file", "write_file"}:
+                        state.transition_phase(
+                            AgentPhase.IMPLEMENTATION,
+                            f"{tool_name} changed workspace state.",
+                        )
+                    elif tool_name == "run_command":
+                        nested = tool_result.get("result")
+                        if not isinstance(nested, dict) or nested.get("returncode") in {None, 0}:
+                            state.transition_phase(
+                                AgentPhase.VERIFICATION,
+                                "A command produced verification evidence.",
+                            )
+                    if state.phase != AgentPhase.PLANNING:
+                        self._emit("phase_changed", {"phase": state.phase.value, "reason": tool_name})
                     if tool_name == "plan_task":
                         nested_plan = tool_result.get("result")
                         if isinstance(nested_plan, dict) and isinstance(nested_plan.get("steps"), list):
@@ -205,6 +261,7 @@ class AgentLoop:
                 state.last_error = "Max tool call budget exceeded."
                 state.elapsed_seconds = time.monotonic() - started
                 state.plan = self.plan_manager.to_dict()
+                state.transition_phase(AgentPhase.FAILED, state.last_error or "tool call limit reached")
                 return state
 
         state.final_answer = "The agent reached the maximum step limit before completing the task."
@@ -212,4 +269,5 @@ class AgentLoop:
         state.elapsed_seconds = time.monotonic() - started
         state.plan = self.plan_manager.to_dict()
         state.plan = self.plan_manager.to_dict()
+        state.transition_phase(AgentPhase.FAILED, state.last_error or "step limit reached")
         return state

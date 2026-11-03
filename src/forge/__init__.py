@@ -11,9 +11,10 @@ __all__ = [
     "SessionStore",
     "GitCheckpointManager",
     "PromptBuilder",
+    "AgentPhase",
 ]
 
-from .agent import AgentLoop
+from .agent import AgentLoop, AgentPhase
 from .git_tools import GitCheckpointManager
 from .model_client import OpenRouterClient
 from .persistence import SessionStore
