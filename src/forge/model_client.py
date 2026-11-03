@@ -201,6 +201,3 @@ class OpenRouterClient:
         if first.id:
             parsed["id"] = first.id
         return parsed
-
-
-GroqClient = OpenRouterClient
