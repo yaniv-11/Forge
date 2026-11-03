@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import re
 import shlex
+import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -135,6 +137,11 @@ def run_command(
     allowlist = allowed_commands if allowed_commands is not None else DEFAULT_COMMAND_ALLOWLIST
     if executable.lower() not in {name.lower() for name in allowlist}:
         raise PermissionError(f"Executable is not allowed: {argv[0]}")
+    resolved_executable = shutil.which(argv[0])
+    if resolved_executable:
+        argv[0] = resolved_executable
+    elif executable in {"python", "python3"}:
+        argv[0] = sys.executable
 
     execution_env = dict(__import__("os").environ)
     if env:
@@ -150,6 +157,15 @@ def run_command(
             timeout=timeout,
             check=False,
         )
+    except OSError as exc:
+        return {
+            "returncode": None,
+            "stdout": "",
+            "stderr": str(exc),
+            "cwd": str(resolved_cwd.relative_to(workspace_root.resolve())),
+            "timed_out": False,
+            "error": str(exc),
+        }
     except subprocess.TimeoutExpired as exc:
         return {
             "returncode": None,
