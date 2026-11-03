@@ -164,6 +164,13 @@ class AgentLoop:
 
             self._trace(f"Executing {len(tool_calls)} tool call(s): {tool_calls}")
 
+            normalized_tool_calls = []
+            for index, tool_call in enumerate(tool_calls):
+                normalized_call = dict(tool_call)
+                normalized_call["id"] = normalized_call.get("id") or f"call_{index + 1}"
+                normalized_tool_calls.append(normalized_call)
+            tool_calls = normalized_tool_calls
+
             assistant_tool_message = {
                 "role": "assistant",
                 "content": "",
