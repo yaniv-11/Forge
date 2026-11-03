@@ -5,7 +5,6 @@ __all__ = [
     "ToolRegistry",
     "ToolDispatcher",
     "OpenRouterClient",
-    "GroqClient",
     "PlanManager",
     "AgentPlan",
     "RepositoryInspector",
@@ -16,7 +15,7 @@ __all__ = [
 
 from .agent import AgentLoop
 from .git_tools import GitCheckpointManager
-from .model_client import GroqClient, OpenRouterClient
+from .model_client import OpenRouterClient
 from .persistence import SessionStore
 from .planning import AgentPlan, PlanManager
 from .prompts import PromptBuilder
