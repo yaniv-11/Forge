@@ -9,8 +9,8 @@ class Settings:
     """Configuration for the minimal Forge runtime."""
 
     workspace_root: Path | str = "."
-    provider: str = "openrouter"
-    model_name: str = "openai/gpt-4o-mini"
+    provider: str | None = None
+    model_name: str | None = None
     api_key: str | None = None
     base_url: str = "https://openrouter.ai/api/v1"
     site_url: str | None = None
@@ -26,6 +26,8 @@ class Settings:
 
         if self.api_key is None:
             self.api_key = os.getenv("OPENROUTER_API_KEY")
+        if self.provider is None:
+            self.provider = os.getenv("FORGE_PROVIDER", "openrouter")
         if self.model_name is None:
             self.model_name = os.getenv("FORGE_MODEL", "openai/gpt-4o-mini")
         if self.site_url is None:
